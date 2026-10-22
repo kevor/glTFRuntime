@@ -1525,6 +1525,28 @@ UMaterialInterface* FglTFRuntimeParser::LoadMaterial(const int32 Index, const Fg
 
 UTextureCube* FglTFRuntimeParser::BuildTextureCube(UObject* Outer, const TArray<FglTFRuntimeMipMap>& MipsXP, const TArray<FglTFRuntimeMipMap>& MipsXN, const TArray<FglTFRuntimeMipMap>& MipsYP, const TArray<FglTFRuntimeMipMap>& MipsYN, const TArray<FglTFRuntimeMipMap>& MipsZP, const TArray<FglTFRuntimeMipMap>& MipsZN, const bool bAutoRotate, const FglTFRuntimeImagesConfig& ImagesConfig, const FglTFRuntimeTextureSampler& Sampler)
 {
+	// Every face is addressed with the mip index/size of the X+ face below, so all six of them
+	// must describe the same mip chain (BuildTexture()/BuildTextureArray() do the same check).
+	if (MipsXP.Num() == 0 ||
+		MipsXN.Num() != MipsXP.Num() || MipsYP.Num() != MipsXP.Num() || MipsYN.Num() != MipsXP.Num() ||
+		MipsZP.Num() != MipsXP.Num() || MipsZN.Num() != MipsXP.Num())
+	{
+		UE_LOG(LogGLTFRuntime, Error, TEXT("Unable to build TextureCube: the six faces must share the same number of mips"));
+		return nullptr;
+	}
+
+	for (int32 FaceMipIndex = 0; FaceMipIndex < MipsXP.Num(); FaceMipIndex++)
+	{
+		const int64 FaceMipSize = MipsXP[FaceMipIndex].Pixels.Num();
+		if (MipsXN[FaceMipIndex].Pixels.Num() != FaceMipSize || MipsYP[FaceMipIndex].Pixels.Num() != FaceMipSize ||
+			MipsYN[FaceMipIndex].Pixels.Num() != FaceMipSize || MipsZP[FaceMipIndex].Pixels.Num() != FaceMipSize ||
+			MipsZN[FaceMipIndex].Pixels.Num() != FaceMipSize)
+		{
+			UE_LOG(LogGLTFRuntime, Error, TEXT("Unable to build TextureCube: mismatching face size for mip %d"), FaceMipIndex);
+			return nullptr;
+		}
+	}
+
 	UTextureCube* Texture = NewObject<UTextureCube>(Outer, NAME_None, RF_Public);
 	FTexturePlatformData* PlatformData = new FTexturePlatformData();
 	PlatformData->SizeX = MipsXP[0].Width;
@@ -1617,7 +1639,7 @@ UTextureCube* FglTFRuntimeParser::BuildTextureCube(UObject* Outer, const TArray<
 			FMemory::Memcpy(reinterpret_cast<uint8*>(Data) + (MipMap.Pixels.Num() * 5), MipsYN[MipIndex].Pixels.GetData(), MipsYN[MipIndex].Pixels.Num());
 		}
 
-		FMemory::Memcpy(reinterpret_cast<uint8*>(Data) + (MipMap.Pixels.Num() * 3), MipsZP[MipIndex].Pixels.GetData(), MipsXN[MipIndex].Pixels.Num());
+		FMemory::Memcpy(reinterpret_cast<uint8*>(Data) + (MipMap.Pixels.Num() * 3), MipsZP[MipIndex].Pixels.GetData(), MipsZP[MipIndex].Pixels.Num());
 		FMemory::Memcpy(reinterpret_cast<uint8*>(Data) + (MipMap.Pixels.Num() * 4), MipsYP[MipIndex].Pixels.GetData(), MipsYP[MipIndex].Pixels.Num());
 
 
@@ -1649,6 +1671,19 @@ UTexture2DArray* FglTFRuntimeParser::BuildTextureArray(UObject* Outer, const TAr
 	if (Mips.Num() == 0)
 	{
 		return nullptr;
+	}
+
+	// Slices are packed with the stride of the first one, so a bigger slice would write past the
+	// end of the bulk data allocation below (LoadImageArray() happily accepts unrelated images).
+	for (int32 SliceIndex = 1; SliceIndex < Mips.Num(); SliceIndex++)
+	{
+		if (Mips[SliceIndex].Pixels.Num() != Mips[0].Pixels.Num() ||
+			Mips[SliceIndex].Width != Mips[0].Width || Mips[SliceIndex].Height != Mips[0].Height ||
+			Mips[SliceIndex].PixelFormat != Mips[0].PixelFormat)
+		{
+			UE_LOG(LogGLTFRuntime, Error, TEXT("Unable to build Texture2DArray: every slice must have the same size and pixel format"));
+			return nullptr;
+		}
 	}
 
 	UTexture2DArray* Texture = NewObject<UTexture2DArray>(Outer, NAME_None, RF_Public);
@@ -1706,6 +1741,249 @@ UTexture2DArray* FglTFRuntimeParser::BuildTextureArray(UObject* Outer, const TAr
 	Texture->CompressionSettings = ImagesConfig.Compression;
 	Texture->LODGroup = ImagesConfig.Group;
 	Texture->SRGB = ImagesConfig.bSRGB;
+
+	if (Sampler.MinFilter != TextureFilter::TF_Default)
+	{
+		Texture->Filter = Sampler.MinFilter;
+	}
+
+	if (Sampler.MagFilter != TextureFilter::TF_Default)
+	{
+		Texture->Filter = Sampler.MagFilter;
+	}
+
+#if ENGINE_MAJOR_VERSION >= 5 || ENGINE_MINOR_VERSION > 25 || WITH_EDITOR
+	Texture->AddressX = Sampler.TileX;
+	Texture->AddressY = Sampler.TileY;
+	Texture->AddressZ = Sampler.TileZ;
+#endif
+	Texture->UpdateResource();
+
+	return Texture;
+}
+
+namespace
+{
+	// Texel access shared by the resize and mip helpers: both supported formats are read as
+	// float RGBA (8 bit values stay in 0..255, so no gamma or normalization is ever applied).
+	bool glTFRuntimeIsResamplableFormat(const EPixelFormat PixelFormat)
+	{
+		return PixelFormat == EPixelFormat::PF_B8G8R8A8 || PixelFormat == EPixelFormat::PF_FloatRGBA;
+	}
+
+	int64 glTFRuntimeBytesPerTexel(const EPixelFormat PixelFormat)
+	{
+		return PixelFormat == EPixelFormat::PF_FloatRGBA ? sizeof(FFloat16Color) : 4;
+	}
+
+	FVector4f glTFRuntimeReadTexel(const FglTFRuntimeMipMap& Mip, const int32 X, const int32 Y)
+	{
+		const int64 Index = static_cast<int64>(Y) * Mip.Width + X;
+		if (Mip.PixelFormat == EPixelFormat::PF_FloatRGBA)
+		{
+			const FFloat16Color* Texel = reinterpret_cast<const FFloat16Color*>(Mip.Pixels.GetData()) + Index;
+			return FVector4f(Texel->R, Texel->G, Texel->B, Texel->A);
+		}
+		const uint8* Texel = Mip.Pixels.GetData() + Index * 4;
+		return FVector4f(Texel[0], Texel[1], Texel[2], Texel[3]);
+	}
+
+	void glTFRuntimeWriteTexel(TArray64<uint8>& Pixels, const EPixelFormat PixelFormat, const int32 Width, const int32 X, const int32 Y, const FVector4f& Value)
+	{
+		const int64 Index = static_cast<int64>(Y) * Width + X;
+		if (PixelFormat == EPixelFormat::PF_FloatRGBA)
+		{
+			FFloat16Color* Texel = reinterpret_cast<FFloat16Color*>(Pixels.GetData()) + Index;
+			Texel->R = Value.X;
+			Texel->G = Value.Y;
+			Texel->B = Value.Z;
+			Texel->A = Value.W;
+			return;
+		}
+		uint8* Texel = Pixels.GetData() + Index * 4;
+		for (int32 Channel = 0; Channel < 4; Channel++)
+		{
+			Texel[Channel] = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(Value[Channel]), 0, 255));
+		}
+	}
+
+	bool glTFRuntimeIsValidMip(const FglTFRuntimeMipMap& Mip)
+	{
+		return glTFRuntimeIsResamplableFormat(Mip.PixelFormat) && Mip.Width > 0 && Mip.Height > 0 &&
+			Mip.Pixels.Num() == static_cast<int64>(Mip.Width) * Mip.Height * glTFRuntimeBytesPerTexel(Mip.PixelFormat);
+	}
+}
+
+bool FglTFRuntimeParser::ResizeMipMap(const FglTFRuntimeMipMap& In, const int32 Width, const int32 Height, FglTFRuntimeMipMap& Out)
+{
+	if (Width <= 0 || Height <= 0 || !glTFRuntimeIsValidMip(In))
+	{
+		return false;
+	}
+
+	// built aside so that In and Out can be the same object
+	TArray64<uint8> NewPixels;
+	NewPixels.AddUninitialized(static_cast<int64>(Width) * Height * glTFRuntimeBytesPerTexel(In.PixelFormat));
+
+	for (int32 Y = 0; Y < Height; Y++)
+	{
+		const float SrcY = FMath::Clamp((Y + 0.5f) * In.Height / Height - 0.5f, 0.0f, static_cast<float>(In.Height - 1));
+		const int32 Y0 = FMath::FloorToInt(SrcY);
+		const int32 Y1 = FMath::Min(Y0 + 1, In.Height - 1);
+		const float FracY = SrcY - Y0;
+		for (int32 X = 0; X < Width; X++)
+		{
+			const float SrcX = FMath::Clamp((X + 0.5f) * In.Width / Width - 0.5f, 0.0f, static_cast<float>(In.Width - 1));
+			const int32 X0 = FMath::FloorToInt(SrcX);
+			const int32 X1 = FMath::Min(X0 + 1, In.Width - 1);
+			const float FracX = SrcX - X0;
+
+			const FVector4f Top = FMath::Lerp(glTFRuntimeReadTexel(In, X0, Y0), glTFRuntimeReadTexel(In, X1, Y0), FracX);
+			const FVector4f Bottom = FMath::Lerp(glTFRuntimeReadTexel(In, X0, Y1), glTFRuntimeReadTexel(In, X1, Y1), FracX);
+			glTFRuntimeWriteTexel(NewPixels, In.PixelFormat, Width, X, Y, FMath::Lerp(Top, Bottom, FracY));
+		}
+	}
+
+	const EPixelFormat PixelFormat = In.PixelFormat;
+	Out.Pixels = MoveTemp(NewPixels);
+	Out.Width = Width;
+	Out.Height = Height;
+	Out.PixelFormat = PixelFormat;
+	return true;
+}
+
+bool FglTFRuntimeParser::GenerateMipChain(const FglTFRuntimeMipMap& Base, TArray<FglTFRuntimeMipMap>& OutChain)
+{
+	if (!glTFRuntimeIsValidMip(Base))
+	{
+		return false;
+	}
+
+	TArray<FglTFRuntimeMipMap> Chain;
+	Chain.Add(Base);
+
+	while (Chain.Last().Width > 1 || Chain.Last().Height > 1)
+	{
+		const int32 SrcWidth = Chain.Last().Width;
+		const int32 SrcHeight = Chain.Last().Height;
+		const int32 DstWidth = FMath::Max(SrcWidth / 2, 1);
+		const int32 DstHeight = FMath::Max(SrcHeight / 2, 1);
+
+		FglTFRuntimeMipMap Next(Base.TextureIndex, Base.PixelFormat, DstWidth, DstHeight);
+		Next.Pixels.AddUninitialized(static_cast<int64>(DstWidth) * DstHeight * glTFRuntimeBytesPerTexel(Base.PixelFormat));
+
+		const FglTFRuntimeMipMap& Src = Chain.Last();
+		for (int32 Y = 0; Y < DstHeight; Y++)
+		{
+			const int32 Y0 = FMath::Min(Y * 2, SrcHeight - 1);
+			const int32 Y1 = FMath::Min(Y * 2 + 1, SrcHeight - 1);
+			for (int32 X = 0; X < DstWidth; X++)
+			{
+				const int32 X0 = FMath::Min(X * 2, SrcWidth - 1);
+				const int32 X1 = FMath::Min(X * 2 + 1, SrcWidth - 1);
+				const FVector4f Sum = glTFRuntimeReadTexel(Src, X0, Y0) + glTFRuntimeReadTexel(Src, X1, Y0) + glTFRuntimeReadTexel(Src, X0, Y1) + glTFRuntimeReadTexel(Src, X1, Y1);
+				glTFRuntimeWriteTexel(Next.Pixels, Base.PixelFormat, DstWidth, X, Y, Sum * 0.25f);
+			}
+		}
+		// Src refers into Chain, so it must not be used after this
+		Chain.Add(MoveTemp(Next));
+	}
+
+	OutChain = MoveTemp(Chain);
+	return true;
+}
+
+UTexture2DArray* FglTFRuntimeParser::BuildTextureArray(UObject* Outer, const TArray<TArray<FglTFRuntimeMipMap>>& SliceMips, const FglTFRuntimeImagesConfig& ImagesConfig, const FglTFRuntimeTextureSampler& Sampler)
+{
+	if (SliceMips.Num() == 0 || SliceMips[0].Num() == 0)
+	{
+		return nullptr;
+	}
+
+	// Every level is packed slice-major with the stride of slice 0, so any mismatch would write
+	// past the end of the bulk data allocation below.
+	const TArray<FglTFRuntimeMipMap>& FirstSlice = SliceMips[0];
+	for (int32 SliceIndex = 0; SliceIndex < SliceMips.Num(); SliceIndex++)
+	{
+		if (SliceMips[SliceIndex].Num() != FirstSlice.Num())
+		{
+			UE_LOG(LogGLTFRuntime, Error, TEXT("Unable to build Texture2DArray: every slice must have the same number of mip levels"));
+			return nullptr;
+		}
+		for (int32 LevelIndex = 0; LevelIndex < FirstSlice.Num(); LevelIndex++)
+		{
+			const FglTFRuntimeMipMap& Level = SliceMips[SliceIndex][LevelIndex];
+			const FglTFRuntimeMipMap& Reference = FirstSlice[LevelIndex];
+			if (Level.Pixels.Num() != Reference.Pixels.Num() ||
+				Level.Width != Reference.Width || Level.Height != Reference.Height ||
+				Level.PixelFormat != FirstSlice[0].PixelFormat || Reference.PixelFormat != FirstSlice[0].PixelFormat)
+			{
+				UE_LOG(LogGLTFRuntime, Error, TEXT("Unable to build Texture2DArray: every slice must have the same size and pixel format at each mip level"));
+				return nullptr;
+			}
+		}
+	}
+
+	UTexture2DArray* Texture = NewObject<UTexture2DArray>(Outer, NAME_None, RF_Public);
+	FTexturePlatformData* PlatformData = new FTexturePlatformData();
+	PlatformData->SizeX = FirstSlice[0].Width;
+	PlatformData->SizeY = FirstSlice[0].Height;
+	PlatformData->PixelFormat = FirstSlice[0].PixelFormat;
+	PlatformData->SetNumSlices(SliceMips.Num());
+
+#if ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 1
+	Texture->SetPlatformData(PlatformData);
+#else
+	Texture->PlatformData = PlatformData;
+#endif
+
+	Texture->NeverStream = true;
+
+	for (int32 LevelIndex = 0; LevelIndex < FirstSlice.Num(); LevelIndex++)
+	{
+		const FglTFRuntimeMipMap& MipMap = FirstSlice[LevelIndex];
+		FTexture2DMipMap* Mip = new FTexture2DMipMap();
+		PlatformData->Mips.Add(Mip);
+		Mip->SizeX = MipMap.Width;
+		Mip->SizeY = MipMap.Height;
+		Mip->SizeZ = SliceMips.Num();
+
+#if !WITH_EDITOR
+#if !NO_LOGGING
+		ELogVerbosity::Type CurrentLogSerializationVerbosity = LogSerialization.GetVerbosity();
+		bool bResetLogVerbosity = false;
+		if (CurrentLogSerializationVerbosity >= ELogVerbosity::Warning)
+		{
+			LogSerialization.SetVerbosity(ELogVerbosity::Error);
+			bResetLogVerbosity = true;
+		}
+#endif
+#endif
+
+		Mip->BulkData.Lock(LOCK_READ_WRITE);
+
+#if !WITH_EDITOR
+#if !NO_LOGGING
+		if (bResetLogVerbosity)
+		{
+			LogSerialization.SetVerbosity(CurrentLogSerializationVerbosity);
+		}
+#endif
+#endif
+		void* Data = Mip->BulkData.Realloc(MipMap.Pixels.Num() * SliceMips.Num());
+		for (int32 SliceIndex = 0; SliceIndex < SliceMips.Num(); SliceIndex++)
+		{
+			const FglTFRuntimeMipMap& SliceLevel = SliceMips[SliceIndex][LevelIndex];
+			FMemory::Memcpy(reinterpret_cast<uint8*>(Data) + (MipMap.Pixels.Num() * SliceIndex), SliceLevel.Pixels.GetData(), SliceLevel.Pixels.Num());
+		}
+
+		Mip->BulkData.Unlock();
+	}
+
+	Texture->CompressionSettings = ImagesConfig.Compression;
+	Texture->LODGroup = ImagesConfig.Group;
+	Texture->SRGB = ImagesConfig.bSRGB;
+	Texture->LODBias = (ImagesConfig.LODBias >= 0 && ImagesConfig.LODBias < (FirstSlice.Num() - 1)) ? ImagesConfig.LODBias : 0;
 
 	if (Sampler.MinFilter != TextureFilter::TF_Default)
 	{
@@ -1850,9 +2128,46 @@ void FglTFRuntimeDDS::LoadMips(const int32 TextureIndex, TArray<FglTFRuntimeMipM
 	}
 	else
 	{
-		if (!(Ptr32[20] & DDPF_ALPHAPIXELS))
+		// slow path for 24 bit textures
+		if (Ptr32[22] == 24)
 		{
-			UE_LOG(LogGLTFRuntime, Warning, TEXT("DDS Uncompressed PixelFormat without Alpha is not supported"));
+			int32 MipWidth = Width;
+			int32 MipHeight = Height;
+
+			for (int32 MipIndex = 0; MipIndex < NumberOfMips; MipIndex++)
+			{
+				const int64 BlockX = GPixelFormats[PixelFormat].BlockSizeX;
+				const int64 BlockY = GPixelFormats[PixelFormat].BlockSizeY;
+				const int64 MipWidthAligned = FMath::Max(((MipWidth / BlockX) + ((MipWidth % BlockX) != 0 ? 1 : 0)) * BlockX, BlockX);
+				const int64 MipHeightAligned = FMath::Max(((MipHeight / BlockY) + ((MipHeight % BlockY) != 0 ? 1 : 0)) * BlockY, BlockY);
+				const int64 MipSize = ((MipWidthAligned * GPixelFormats[PixelFormat].BlockBytes * MipHeightAligned) / (BlockX * BlockY)) * NumberOfSlices;
+
+				const int64 DDSMipSize = (MipWidthAligned * 3 * MipHeightAligned) * NumberOfSlices;
+				if (PixelsOffset + DDSMipSize > Data.Num())
+				{
+					return;
+				}
+				FglTFRuntimeMipMap MipMap(TextureIndex, PixelFormat, MipWidth, MipHeight);
+				MipMap.Pixels.AddUninitialized(MipSize);
+
+				for (int64 PixelIndex = 0; PixelIndex < MipWidthAligned * MipHeightAligned; PixelIndex++)
+				{
+					MipMap.Pixels[PixelIndex * 4] = Data[PixelsOffset + (PixelIndex * 3)];
+					MipMap.Pixels[PixelIndex * 4 + 1] = Data[PixelsOffset + (PixelIndex * 3 + 1)];
+					MipMap.Pixels[PixelIndex * 4 + 2] = Data[PixelsOffset + (PixelIndex * 3 + 2)];
+					MipMap.Pixels[PixelIndex * 4 + 3] = 0xff;
+				}
+
+				Mips.Add(MoveTemp(MipMap));
+				PixelsOffset += DDSMipSize;
+				MipWidth = FMath::Max(MipWidth / 2, 1);
+				MipHeight = FMath::Max(MipHeight / 2, 1);
+			}
+			return;
+		}
+		else if (Ptr32[22] != 32)
+		{
+			UE_LOG(LogGLTFRuntime, Warning, TEXT("DDS Uncompressed Pixel Size must be 24 or 32 bits (found %u)"), Ptr32[22]);
 			return;
 		}
 	}
